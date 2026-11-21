@@ -23,26 +23,51 @@ import com.pedro.library.rtmp.RtmpFromFile
 object LiveState {
     @Volatile var running = false
     @Volatile var status = "Belum live"
+    @Volatile var detail = ""
     @Volatile var startedAt = 0L
     @Volatile var endAt = 0L
+}
+
+private class Target(val label: String, val url: String) {
+    var stream: RtmpFromFile? = null
+    var gen = 0
+    var attempts = 0
+    var retryScheduled = false
+    var connected = false
+    var dead = false
+    var info = "Menyiapkan..."
 }
 
 class LiveService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private var stream: RtmpFromFile? = null
+    private val targets = ArrayList<Target>()
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var videoUri: Uri? = null
-    private var url = ""
-    private var bitrate = 2500 * 1000
+    private var baseBitrate = 2500 * 1000
+    private var mode = 0
+    private var level = 0
+    private var lastFailAt = 0L
     private var stopping = false
-    private var retryScheduled = false
-    private var attempts = 0
-    private var generation = 0
 
     private val stopTimer = Runnable {
         stopEverything("Waktu habis, live berhenti otomatis")
+    }
+
+    // Mode Otomatis: naikkan kualitas lagi kalau sudah stabil 20 menit
+    private val upCheck = object : Runnable {
+        override fun run() {
+            if (stopping) return
+            if (mode == 2 && level > 0 &&
+                targets.all { it.connected || it.dead } &&
+                System.currentTimeMillis() - lastFailAt > 20 * 60_000L
+            ) {
+                level--
+                restartAll()
+            }
+            handler.postDelayed(this, 5 * 60_000L)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -56,25 +81,38 @@ class LiveService : Service() {
             ACTION_START -> {
                 startForegroundCompat("Menyiapkan live...")
                 if (LiveState.running) return START_NOT_STICKY
+                stopping = false
                 val uriText = intent.getStringExtra(EXTRA_URI)
-                val target = intent.getStringExtra(EXTRA_URL)
-                if (uriText == null || target == null) {
+                val urls = intent.getStringArrayExtra(EXTRA_URLS)
+                val labels = intent.getStringArrayExtra(EXTRA_LABELS)
+                if (uriText == null || urls == null || urls.isEmpty()) {
                     stopEverything("Data live tidak lengkap")
                     return START_NOT_STICKY
                 }
+                targets.clear()
+                for (i in urls.indices) {
+                    targets.add(Target(labels?.getOrNull(i) ?: "Tujuan ${i + 1}", urls[i]))
+                }
                 videoUri = Uri.parse(uriText)
-                url = target
-                bitrate = intent.getIntExtra(EXTRA_BITRATE, 2500) * 1000
+                baseBitrate = intent.getIntExtra(EXTRA_BITRATE, 2500) * 1000
+                mode = intent.getIntExtra(EXTRA_MODE, 0)
+                level = 0
+                lastFailAt = 0L
                 val hours = intent.getDoubleExtra(EXTRA_HOURS, 12.0)
                 val durationMs = (hours * 3600_000).toLong()
-                stopping = false
-                attempts = 0
                 LiveState.running = true
                 LiveState.startedAt = System.currentTimeMillis()
                 LiveState.endAt = LiveState.startedAt + durationMs
+                getSharedPreferences("live", Context.MODE_PRIVATE).edit()
+                    .putBoolean("wasLive", true)
+                    .putLong("endAt", LiveState.endAt)
+                    .apply()
                 acquireLocks(durationMs)
                 handler.postDelayed(stopTimer, durationMs)
-                beginStream()
+                handler.postDelayed(upCheck, 5 * 60_000L)
+                for ((i, t) in targets.withIndex()) {
+                    handler.postDelayed({ beginStream(t) }, i * 1500L)
+                }
             }
             ACTION_STOP -> stopEverything("Live dihentikan")
             else -> stopSelf()
@@ -82,41 +120,58 @@ class LiveService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun makeChecker(gen: Int) = object : ConnectChecker {
+    private fun videoBitrate(): Int = when (mode) {
+        1 -> minOf(baseBitrate, 600_000)
+        2 -> (baseBitrate * FACTORS[level]).toInt().coerceAtLeast(500_000).coerceAtMost(baseBitrate)
+        else -> baseBitrate
+    }
+
+    private fun audioBitrate(): Int =
+        if (mode == 1 || (mode == 2 && level >= 2)) 64_000 else 128_000
+
+    private fun makeChecker(t: Target, gen: Int) = object : ConnectChecker {
         override fun onConnectionStarted(url: String) {}
         override fun onConnectionSuccess() {
             handler.post {
-                if (gen == generation) {
-                    attempts = 0
-                    setStatus("LIVE berjalan")
+                if (gen == t.gen) {
+                    t.attempts = 0
+                    t.connected = true
+                    t.info = "LIVE berjalan"
+                    refreshStatus()
                 }
             }
         }
         override fun onConnectionFailed(reason: String) {
             handler.post {
-                if (gen == generation) scheduleRetry("Gagal sambung ($reason)")
+                if (gen == t.gen) failure(t, "Gagal sambung ($reason)")
             }
         }
         override fun onNewBitrate(bitrate: Long) {}
         override fun onDisconnect() {
             handler.post {
-                if (gen == generation) scheduleRetry("Koneksi terputus")
+                if (gen == t.gen) failure(t, "Koneksi terputus")
             }
         }
         override fun onAuthError() {
             handler.post {
-                if (gen == generation) stopEverything("Stream Key ditolak server")
+                if (gen == t.gen) {
+                    t.dead = true
+                    t.connected = false
+                    t.info = "Stream Key ditolak server"
+                    refreshStatus()
+                    if (targets.all { it.dead }) stopEverything("Stream Key ditolak server")
+                }
             }
         }
         override fun onAuthSuccess() {}
     }
 
-    private fun beginStream() {
-        if (stopping) return
-        retryScheduled = false
-        releaseStream()
-        generation++
-        val gen = generation
+    private fun beginStream(t: Target) {
+        if (stopping || t.dead) return
+        t.retryScheduled = false
+        releaseStream(t)
+        t.gen++
+        val gen = t.gen
         try {
             val video = object : VideoDecoderInterface {
                 override fun onVideoDecoderFinished() {}
@@ -124,57 +179,89 @@ class LiveService : Service() {
             val audio = object : AudioDecoderInterface {
                 override fun onAudioDecoderFinished() {}
             }
-            val s = RtmpFromFile(makeChecker(gen), video, audio)
-            stream = s
+            val s = RtmpFromFile(makeChecker(t, gen), video, audio)
+            t.stream = s
             val uri = videoUri ?: return
-            if (!s.prepareVideo(applicationContext, uri, bitrate, 0)) {
+            if (!s.prepareVideo(applicationContext, uri, videoBitrate(), 0)) {
                 stopEverything("Video tidak bisa dibaca. Pilih ulang video (MP4, maks 1080p)")
                 return
             }
-            s.prepareAudio(applicationContext, uri, 128 * 1000)
+            s.prepareAudio(applicationContext, uri, audioBitrate())
             s.setLoopMode(true)
-            setStatus("Menyambung ke server...")
-            s.startStream(url)
+            t.info = "Menyambung ke server..."
+            refreshStatus()
+            s.startStream(t.url)
         } catch (e: Exception) {
-            scheduleRetry("Error: ${e.message}")
+            failure(t, "Error: ${e.message}")
         }
     }
 
-    private fun scheduleRetry(reason: String) {
-        if (stopping || retryScheduled) return
-        retryScheduled = true
-        attempts++
-        val delay = minOf(5000L * attempts, 30000L)
-        setStatus("$reason. Coba lagi ${delay / 1000} dtk (percobaan $attempts)")
-        handler.postDelayed({ beginStream() }, delay)
+    private fun failure(t: Target, reason: String) {
+        if (stopping) return
+        t.connected = false
+        lastFailAt = System.currentTimeMillis()
+        // Mode Otomatis: gagal berulang -> turunkan kualitas
+        if (mode == 2 && t.attempts >= 1 && level < FACTORS.size - 1) level++
+        scheduleRetry(t, reason)
     }
 
-    private fun releaseStream() {
+    private fun scheduleRetry(t: Target, reason: String) {
+        if (stopping || t.retryScheduled || t.dead) return
+        t.retryScheduled = true
+        t.attempts++
+        val delay = minOf(5000L * t.attempts, 30000L)
+        t.info = "$reason. Coba lagi ${delay / 1000} dtk (percobaan ${t.attempts})"
+        refreshStatus()
+        handler.postDelayed({ beginStream(t) }, delay)
+    }
+
+    private fun restartAll() {
+        for ((i, t) in targets.withIndex()) {
+            if (t.dead) continue
+            t.attempts = 0
+            handler.postDelayed({ beginStream(t) }, i * 1500L)
+        }
+    }
+
+    private fun releaseStream(t: Target) {
         try {
-            stream?.stopStream()
+            t.stream?.stopStream()
         } catch (_: Exception) {
         }
-        stream = null
+        t.stream = null
     }
 
     private fun stopEverything(msg: String) {
         if (stopping) return
         stopping = true
         handler.removeCallbacksAndMessages(null)
-        generation++
-        releaseStream()
+        for (t in targets) {
+            t.gen++
+            releaseStream(t)
+        }
         releaseLocks()
+        getSharedPreferences("live", Context.MODE_PRIVATE).edit()
+            .putBoolean("wasLive", false).apply()
         LiveState.running = false
         LiveState.status = msg
+        LiveState.detail = ""
         stopForeground(true)
         stopSelf()
     }
 
-    private fun setStatus(text: String) {
+    private fun refreshStatus() {
+        val text = targets.joinToString("\n") { it.label + ": " + it.info }
+        val modeName = when (mode) {
+            1 -> "Sinyal lemah"
+            2 -> "Otomatis"
+            else -> "Normal"
+        }
         LiveState.status = text
+        LiveState.detail = "Mode $modeName, video ${videoBitrate() / 1000} kbps"
         if (!stopping) {
+            val short = targets.joinToString(" | ") { it.label + ": " + (if (it.connected) "LIVE" else "...") }
             getSystemService(NotificationManager::class.java)
-                .notify(NOTIF_ID, buildNotification(text))
+                .notify(NOTIF_ID, buildNotification(short))
         }
     }
 
@@ -246,8 +333,10 @@ class LiveService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        generation++
-        releaseStream()
+        for (t in targets) {
+            t.gen++
+            releaseStream(t)
+        }
         releaseLocks()
         if (LiveState.running) {
             LiveState.running = false
@@ -260,9 +349,12 @@ class LiveService : Service() {
         const val ACTION_START = "com.liveasmr.app.START"
         const val ACTION_STOP = "com.liveasmr.app.STOP"
         const val EXTRA_URI = "uri"
-        const val EXTRA_URL = "url"
+        const val EXTRA_URLS = "urls"
+        const val EXTRA_LABELS = "labels"
         const val EXTRA_BITRATE = "bitrate"
         const val EXTRA_HOURS = "hours"
+        const val EXTRA_MODE = "mode"
+        private val FACTORS = doubleArrayOf(1.0, 0.6, 0.35)
         private const val CHANNEL_ID = "live_asmr"
         private const val NOTIF_ID = 11
     }
